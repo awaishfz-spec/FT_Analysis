@@ -1,0 +1,1551 @@
+---
+title: "Finger Tapping Analysis"
+author: "Awais Hafeez"
+date: "11/5/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ez)
+library(pracma)
+library(dplyr)
+library(reshape2)
+source('stat_smooth_fun_pval.R')
+source('summarySE.R')
+#library(plyr)
+library(data.table)
+library(ggpubr)
+library(rstatix)
+```
+
+## Function
+
+
+```{r echo=FALSE,include=FALSE}
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+```
+
+```{r echo=FALSE, include=FALSE}
+set_peaks_column <- function(x){
+  peaks <- findpeaks(x,nups = 3,ndowns = 3)
+  peaks_idx <- peaks[,2]
+  
+  is_peak <- rep(FALSE, length(x))
+  
+  is_peak[peaks_idx] = TRUE
+  return(is_peak)
+}
+```
+
+```{r echo=FALSE,include=FALSE}
+corfun<-function(x, y) {
+  corr=(cor.test(x, y,
+                 alternative="two.sided", method="pearson"))
+}
+```
+
+```{r echo=FALSE,include=FALSE}
+get_ftapping <- function(df_subset){
+i1 <- !is.na(inverse.rle(within.list(rle(df_subset$is_reaching), 
+     values[c(1, length(values))][values[c(1, length(values))] == FALSE] <- NA)))
+data <- df_subset[i1, , drop = FALSE]
+return(data)
+}
+```
+
+```{r echo=FALSE, include=FALSE}
+sig_len <- function(df_subset){
+  len <- length(df_subset$speed)
+  
+  data <- as.data.frame(df_subset) %>% 
+    mutate(speed_len = len)
+  
+  return(data)
+}
+```
+
+```{r echo=FALSE, include=FALSE}
+amplitude_CV <- function(df_subset){
+  amp_signal <- df_subset$dist_norm
+  amp_signal <- amp_signal - mean(amp_signal)
+  
+  win_len <- 60
+  energy_list <- 0
+  
+  l <- length(amp_signal)
+  ra <- l - win_len
+  
+  for (i in 0:ra){
+    
+    temp <- amp_signal[i:win_len+1]
+    energy_list[i] <- max(temp,na.rm = TRUE) - min(temp,na.rm = TRUE)
+  }
+  
+  
+  data <- as.data.frame(df_subset) %>% 
+    mutate(windows_CV = sd(energy_list)/mean(energy_list))
+  
+  return(data)
+}
+```
+
+```{r echo=FALSE, include=FALSE}
+read_and_filter_media <- function(file){
+  
+  movement <- read_csv(file) 
+  dt <- 1/ 60
+  numframes = length(movement$Thumb_Tip_X)
+  df <- as.data.frame(movement) %>% 
+    mutate_at(vars(Thumb_Tip_X:Index_Finger_Tip_Y), funs(ifelse(. == -999, NA, .))) %>% 
+    mutate_at(vars(Thumb_Tip_X:Index_Finger_Tip_Y), na.approx, na.rm = FALSE) %>% # lerp
+    mutate(frame = 0:(numframes-1))
+  # pad data
+  paddata <- 100
+  
+  data <- tibble(frame = (-paddata):(numframes+paddata-1))
+  
+  data <- data %>%
+    left_join(y = df, by = "frame") %>%
+    fill(-frame, .direction = "down") %>% # padded NAs replaced with first/last position
+    fill(-frame, .direction = "up")
+  
+  nyq_f <- 30
+  
+  bf_low <- butter(4, 5/nyq_f , type="low",plane = 'z')
+  
+  # filter  
+  data <- data %>% 
+    mutate_at(vars(-frame), function(x) filtfilt(filt = bf_low, x = x)) %>% 
+    dplyr::filter(frame >= 0, frame < numframes) %>% 
+    mutate(time = frame * dt) %>% 
+    select(-frame)
+  
+  return(data)
+}
+```
+
+```{r echo=FALSE, include=FALSE}
+delta_t <- 0.01667
+```
+## Aims and Objectives
+
+  Assessment heavily relies on clinician’s experience and his/her ability to detect mild impairments and progressive decline in motor functions in PD progression. Physician analyze and rate motor performance by observing speed, amplitude, rhythm and amplitude decrement as movements are continued. Hence, considerable inter-rater variability and subjective evaluation may result in inaccurate diagnosis and rough quantification. Therefore, we aim to investigate the potential usage of low-cost, portable motion capture system (BIGKAT; developed in our lab, PACLab) for the objective measurement of bradykinesia against commercially available motion capture system Optotrak (Optotrak, NDI Inc).  
+  With the aim to overcome the disadvantage of subjective evaluation and to provide more sensitive continuous measures, several instrumental approaches have been proposed to assess bradykinesia via finger tapping and in this study, we sought to investigate the quantitative measures obtained from  Optotrak & BIGKAT and qualitative measures as rated by the neurologist by looking at the smartphone camera videos. Participants were instructed to repeatedly tap their index finger on the thumb as quickly AND as big as possible, while Optotrak, BIGKAT and smartphone recorded FT movements simultaneously.  
+  Firslty, as reproted in the previous literature, optoelectronic motion capture system such as Optotrak can significantly differentiate PD patients from healthy controls by statiscally analysing the objective measures extracted from the distance between the thumb and index finger IREDs, as movements are continued. And we aim to draw similar conclusions from expensive Optotrak system. Secondly, how these quntitative measures are correlated with the subjective evaluation of camera videos rated by two nerurologist according to UPDRS scale. And thirdly, we aim to compare BIGKAT performance against Optotrak by running correlation and regression analysis between the quantiative measures obtained from both devices and therefore exploiting its potential usage in large scale, routine clinical settings.  
+
+
+## Importing data
+Finger tapping movement of 60 hands (including left and right) were obtained from 10 patients with idiopathic Parkinsons's disease and 9 healthy controls using BIGKAT and Optotrak by attaching infra-red markers to the thumb and finger tip. Four trials of 17s length were recorded from each hand.  
+  
+```{r message=FALSE, warning=FALSE}
+ft_files <- tibble(files = list.files("csvfiles_big_op_unfil", full.names= TRUE, recursive = TRUE))
+
+FT_movement <- ft_files %>% 
+  mutate(data = map(files, read_csv)) %>% 
+  unnest(data, .drop = FALSE) %>% 
+  separate(fileName, c("Device","ppid","Hand","trial_num"), sep = "_",extra='drop') %>%
+  select(-files) %>%
+  mutate(pp = substr(ppid, 1, 2))%>%
+  mutate_at(vars(pp), funs(ifelse(pp == " P", "Patient", "Control"))) %>% 
+  select(Device,ppid,pp,Hand,trial_num,everything())%>% 
+  data.frame()
+```
+
+## Processing
+3D coordinates of the finger tapping movement obtained from both devices (BIGKAT & Optotrak) were standarised across all trials, by using the maximum opening distance between finger and thumb tip and normalizing this to a value of 1. Calculating absolute speed as a rate of change of the distance between finger and thumb tip over time. Deteriming the movement onset using threshold of 50mm/s.  
+  
+```{r message=FALSE, warning=FALSE}
+
+FT_analysis <- FT_movement  %>% 
+  group_by(ppid,Hand,trial_num,Device) %>% 
+  mutate(time = (row_number() * delta_t)-delta_t,
+         distance_thumb_finger = ((finger_x - thumb_x)^2 + (finger_y - thumb_y)^2 + (finger_z - 
+                                                                                     thumb_z)^2)^0.5,
+         abs_dis = abs(distance_thumb_finger)) %>% 
+  #select(-starts_with('th'),-starts_with('fi')) %>%
+  mutate(dist_norm = normalize(distance_thumb_finger),
+         abs_dist_norm = normalize(abs_dis),
+         speed = abs(c(NA,diff(distance_thumb_finger)/diff(time))),
+         is_reaching = speed > 50)
+         #is_tapping = abs_dis >80,
+         #acc = abs(c(NA,diff(speed)/diff(time))),
+         #is_reaching = acc > 1000)
+```
+
+### Trimming Data
+Trimming data based on customized 'get_ftapping' function to remove the first set of rows where the absolute speed is lower than threshold.  
+  
+```{r include=TRUE}
+df_ft_trim <- FT_analysis  %>%
+  select(ppid, Hand, trial_num, Device, pp, dist_norm,time,abs_dis,is_reaching,speed) %>% 
+  group_by(ppid,Hand,trial_num,Device) %>%
+  dplyr::filter(!is.na(is_reaching)) %>% 
+  do(get_ftapping(.)) %>% 
+  mutate(t =(row_number()*delta_t)-delta_t)
+```
+
+#### Trial Visulaization
+  
+  Plotting absolute distance over time obtained from bith devices for a single trial and participant. 
+
+#### Healthy Control 
+```{r include=FALSE}
+ft_vel1 <- df_ft_trim %>% dplyr::filter(ppid == " C06 ") %>% dplyr::filter(trial_num == " 1") %>% filter( Hand == " Left ")
+```
+
+  Figure below shows amplitude variation over time for a healthy control  
+    
+```{r echo=FALSE}
+a <- ggplot(ft_vel1 %>% filter(t <= 12)  ,
+       aes(x=t, y = dist_norm, color=Device))+
+       geom_path(show.legend = FALSE ,size = 0.8) +
+  xlab('') +
+  ylab('') +
+  theme_bw()+
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        legend.box.just = "left",legend.justification = c(0.9999,0.9999),
+        legend.position=c(0.9999,0.9999),legend.title = element_blank(),
+        legend.background = element_rect(fill = alpha("white",0)),
+        plot.title = element_text(hjust = 0.5))+
+  guides(colour = guide_legend(nrow = 1))+
+  labs(title = 'Distance b/w thumb & Finger (mm)')
+  ggsave('graphs/C06_Left_T1_op.png',type='cairo', width= 6, height= 4, dpi = 800)
+```
+#### PD Patient 
+```{r include=FALSE}
+ft_vel2 <- df_ft_trim %>% filter(ppid == " P70 ") %>% filter(trial_num == " 2") %>% filter( Hand == " Right ")
+```
+
+  Figure below shows amplitude variation over time by PD patient
+    
+```{r echo=FALSE}
+b <- ggplot(ft_vel2 %>% filter(t <= 12)  ,
+       aes(x=t, y = dist_norm, color=Device))+
+       geom_path(size = 0.8) +
+  xlab("Time (s)") +
+  ylab("") +
+  theme_bw()+
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        legend.box.just = "top",legend.justification = c(1,1.1),
+        legend.position=c(1,1.1),legend.title = element_blank(),
+        legend.background = element_rect(fill = alpha("white",0)))+
+  guides(colour = guide_legend(nrow = 1))
+  ggsave('graphs/P72_Right_T2_op.png',type='cairo', width= 6, height= 4, dpi = 800)
+```
+
+```{r}
+ggarrange(a, b, labels = c("a", "b"),
+                    ncol = 1, nrow = 2)+
+ggsave('graphs/P72_C06_op.png',type='cairo', width= 7, height= 4, dpi = 800)
+```
+
+### Average speed and average speed peaks
+A measure of speed was calculated as the mean rate of change of the normalised distance between finger and thumb tip over time.
+
+```{r echo=FALSE,include=FALSE}
+df_speed <-  df_ft_trim %>% dplyr::filter(!grepl("P64",ppid)) %>% 
+  select(ppid, Hand, trial_num, Device, pp, dist_norm,t) %>% 
+  group_by(ppid,Hand,trial_num,Device,pp) %>% 
+  mutate(mean_dis = dist_norm - mean(dist_norm),
+         speed = abs(c(NA,diff(mean_dis)/diff(t)))) %>% 
+  dplyr::filter(!is.na(speed))
+
+```
+
+```{r include=FALSE}
+df_speed_ave <-  df_speed %>% 
+  group_by(ppid,Hand,trial_num,Device,pp) %>%
+  mutate(ave_speed = mean(speed),
+         is_peak = set_peaks_column(mean_dis)) %>% 
+  dplyr::filter(is_peak) %>% 
+  mutate(speed_peak = abs(c(NA, diff(speed)/diff(t)))) %>%
+  dplyr::filter(!is.na(speed_peak)) %>% 
+  mutate(ave_speed_peak = mean(speed_peak))
+```
+
+
+
+```{r include=FALSE}
+df_avg_speed_op <- df_speed_ave %>% ungroup() %>% filter(Device == 'OPTOTRAK ') 
+```
+
+
+```{r echo=FALSE}
+ave_speed_one.way <- aov(ave_speed ~ pp, data = df_avg_speed_op)
+summary(ave_speed_one.way)
+
+```
+#### Effect of pp on average speed
+```{r }
+avSpeed.pp_pwc <- df_avg_speed_op %>%
+  pairwise_t_test(
+    ave_speed ~ pp, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+avSpeed.pp_pwc
+```
+#### cohen's d
+```{r echo=FALSE}
+
+speed.pp_d <- df_avg_speed_op %>%
+  cohens_d(ave_speed ~ pp, paired = FALSE)
+speed.pp_d 
+```
+
+##### two way 
+```{r echo=FALSE}
+ave_speed_two.way <- aov(ave_speed ~ pp*Hand, data = df_avg_speed_op)
+summary(ave_speed_two.way)
+
+```
+
+#### SE,SD, CI
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+speed_pp_se <- summarySE(df_avg_speed_op, measurevar="ave_speed", groupvars=c("pp"))
+speed_pp_se
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+speed_se_pp <- summarySE(df_avg_speed_op, measurevar="ave_speed", groupvars=c("Hand","pp"))
+speed_se_pp
+```
+#### Tukey-HSD Test
+Tukey-HSD test is conducted to find significant differences between patients and control. Data from both devices (Bigkat and optotrak) effectively determined speed differences between patients and control as shown in figure. 
+```{r echo=FALSE}
+speed_pp <- df_avg_speed_op %>%
+  group_by(Hand) %>%
+  tukey_hsd(ave_speed ~ pp)
+speed_pp
+```
+
+```{r warning=FALSE, echo=FALSE}
+pd <- position_dodge(0.3)
+a_speed <- ggplot(speed_se_pp , aes(x=as.factor(pp), y=ave_speed, color=Hand, group=Hand,linetype=Hand)) + 
+  geom_errorbar(aes(ymin=(ave_speed-sd), ymax=(ave_speed+sd),
+                    color=Hand), size=1, width=.3, position=pd) +
+  geom_line(position=pd) +
+  geom_point(position=pd, size=3, shape=21, fill="white") + # 21 is filled circle
+  xlab("") +
+  ylab("Average speed (mm/s)") +
+  scale_colour_hue(name="Hand",    # Legend label, use darker colors
+                   breaks=c("Left", "Right"),
+                   labels=c("Left", "Right"),
+                   l=40) +                    # Use darker colors, lightness=40
+  expand_limits(y=0) +                        # Expand y range
+  scale_y_continuous(breaks=0:8*1) +     
+  theme_bw() +
+  theme(strip.background = element_rect(color = 'black',fill = 'NA',size = 1.2)) +
+  theme(panel.background = element_rect(color = 'black',fill = 'NA',size = 1.2)) +
+  stat_pvalue_manual(speed_pp, label ="p.adj.signif",
+                     y.position = c(5.9,6.2),
+                     xmin = "group1",xmax  = "group2",tip.length = 0,
+                     step.group.by = "Hand",linetype ="Hand",
+                     color = "Hand",position = pd)+
+  labs(color  = "Hand", linetype = "Hand", group = "Hand") +
+  #facet_grid(~Device) +
+  theme(legend.box.just = "left",legend.justification = c(0.99,0.1), legend.position=c(0.99,0.1))+
+  ggsave('graphs/op_trim_average_speed.png',type='cairo', width= 4, height= 4, dpi = 800)
+```
+
+
+### Amplitude variation 
+
+```{r message=FALSE, warning=FALSE}
+ft_files_amp <- tibble(files = list.files("csvfiles_big_op", full.names= TRUE, recursive = TRUE))
+
+FT_movement_amp <- ft_files_amp %>% 
+  mutate(data = map(files, read_csv)) %>% 
+  unnest(data, .drop = FALSE) %>% 
+  separate(fileName, c("Device","ppid","Hand","trial_num"), sep = "_",extra='drop') %>%
+  select(-files) %>%
+  mutate(pp = substr(ppid, 1, 2))%>%
+  mutate_at(vars(pp), funs(ifelse(pp == " P", "Patient", "Control"))) %>% 
+  select(Device,ppid,pp,Hand,trial_num,everything())%>% 
+  data.frame()
+```
+
+```{r message=FALSE, warning=FALSE}
+
+FT_analysis_amp <- FT_movement_amp  %>% 
+  group_by(ppid,Hand,trial_num,Device) %>% 
+  mutate(time = (row_number() * delta_t)-delta_t,
+         distance_thumb_finger = ((finger_x - thumb_x)^2 + (finger_y - thumb_y)^2 + (finger_z - 
+                                                                                     thumb_z)^2)^0.5,
+         abs_dis = abs(distance_thumb_finger)) %>% 
+  #select(-starts_with('th'),-starts_with('fi')) %>%
+  mutate(dist_norm = normalize(distance_thumb_finger),
+         abs_dist_norm = normalize(abs_dis),
+         speed = abs(c(NA,diff(distance_thumb_finger)/diff(time))),
+         is_reaching = speed > 50)
+         #is_tapping = abs_dis >80,
+         #acc = abs(c(NA,diff(speed)/diff(time))),
+         #is_reaching = acc > 1000)
+```
+
+  
+```{r include=TRUE}
+df_ft_trim_amp <- FT_analysis_amp  %>%
+  select(ppid, Hand, trial_num, Device, pp, dist_norm,time,abs_dis,is_reaching,speed) %>% 
+  group_by(ppid,Hand,trial_num,Device) %>%
+  dplyr::filter(!is.na(is_reaching)) %>% 
+  do(get_ftapping(.)) %>% 
+  mutate(t =(row_number()*delta_t)-delta_t)
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE,include=FALSE}
+detach("package:plyr", unload = TRUE)
+```
+A measure of amplitude variability was calculated by dividing each time series into one-second windows, with maximal overlap, and then calculating the coefficient of variation of the mean difference between the maximum and minimum amplitudes in each window. A special function was developed to determine the variation. 
+```{r message=FALSE, warning=FALSE}
+df_amplitude <- df_ft_trim  %>% dplyr::filter(!grepl("P64",ppid)) %>% 
+  select(ppid, Hand, trial_num, Device, pp, dist_norm,t) %>% 
+  group_by(ppid,Hand,trial_num,Device) %>%
+  do(amplitude_CV(.))
+```
+
+```{r message=FALSE, warning=FALSE}
+df_amplitude_amp <- df_ft_trim_amp  %>% dplyr::filter(!grepl("P64",ppid)) %>% 
+  select(ppid, Hand, trial_num, Device, pp, dist_norm,t) %>% 
+  group_by(ppid,Hand,trial_num,Device) %>%
+  do(amplitude_CV(.))
+```
+
+```{r message=FALSE, warning=FALSE,echo=FALSE,include=FALSE}
+
+df_amplitude_DV <- df_amplitude %>% 
+  group_by(ppid,Hand,trial_num,Device,pp) %>% 
+  mutate(mean_dis = dist_norm - mean(dist_norm),
+         is_peak = set_peaks_column(mean_dis)) %>%
+  dplyr::filter(is_peak) %>% 
+  mutate(peak_diff = c(NA,diff(mean_dis)-mean(diff(mean_dis)))) %>% 
+  dplyr::filter(!is.na(peak_diff)) %>% 
+  mutate(DV = sd(peak_diff))
+```
+
+
+```{r include=FALSE}
+df_amp_op <- df_amplitude_amp %>% ungroup() %>% filter(Device == 'OPTOTRAK ')
+```
+
+#### Two way ANOVA
+```{r echo=FALSE}
+hand_CV_two.way <- aov(windows_CV ~ Hand, data = df_amp_op%>% filter(pp == 'Patient'))
+summary(hand_CV_two.way)
+```
+```{r}
+tukey.amp_hand_pat <- TukeyHSD(hand_CV_two.way)
+tukey.amp_hand_pat
+```
+
+#### Two way ANOVA
+```{r echo=FALSE}
+CV_two.way <- aov(windows_CV ~ pp*Hand, data = df_amp_op)
+summary(CV_two.way)
+```
+
+#### Effect of pp on amplitude decrement
+```{r }
+CV.pp_pwc <- df_amp_op %>%
+  pairwise_t_test(
+    windows_CV ~ pp, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+CV.pp_pwc
+```
+```{r }
+
+CV.pp_d <- df_amp_op %>%
+  cohens_d(windows_CV ~ pp,
+           paired=FALSE)
+CV.pp_d 
+```
+
+
+#### Tukey HSD
+
+```{r}
+tukey.amp_two.way <- TukeyHSD(CV_two.way)
+tukey.amp_two.way
+```
+
+
+#### SD, SE and CI
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+amplitude_se_pp <- summarySE(df_amp_op, measurevar="windows_CV", groupvars=c("Hand","pp"))
+amplitude_se_pp
+```
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+amp_se_pp <- summarySE(df_amp_op, measurevar="windows_CV", groupvars=c("pp"))
+amp_se_pp
+```
+
+#### Tukey-HSD Test
+```{r echo=FALSE}
+amplitude_pp <- df_amp_op %>%
+  group_by(Hand) %>%
+  tukey_hsd(windows_CV ~ pp)
+amplitude_pp
+```
+
+```{r message=FALSE, warning=FALSE,echo=FALSE}
+pd <- position_dodge(0.3)
+b_amp <- ggplot(amplitude_se_pp , aes(x=as.factor(pp), y=windows_CV, colour=Hand, group=Hand,linetype=Hand)) + 
+  geom_errorbar(aes(ymin=(windows_CV-sd), ymax=(windows_CV+sd),
+                    colour=Hand), size=1, width=.3, position=pd) +
+  geom_line(position=pd) +
+  geom_point(position=pd, size=3, shape=21, fill="white") + # 21 is filled circle
+  xlab("") +
+  ylab("Amplitude CoV") +
+  scale_colour_hue(name="Hand",    # Legend label, use darker colors
+                   breaks=c("Left", "Right"),
+                   labels=c("Left", "Right"),
+                   l=40) +                    # Use darker colors, lightness=40
+  expand_limits(y=0) +                        # Expand y range
+  scale_y_continuous(breaks=0:4*0.1) +     
+  theme_bw() +
+  theme(strip.background = element_rect(color = 'black',fill = 'NA',size = 1.2)) +
+  theme(panel.background = element_rect(color = 'black',fill = 'NA',size = 1.2)) +
+  stat_pvalue_manual(amplitude_pp, label ="p.adj.signif",
+                     y.position = c(0.37,0.4),
+                     xmin = "group1",xmax  = "group2",tip.length = 0,
+                     step.group.by = "Hand",linetype ="Hand",
+                     color = "Hand",position = pd)+
+  labs(color  = "Hand", linetype = "Hand", group = "Hand") +
+
+  theme(legend.box.just = "left",legend.justification = c(0.98,0.01), legend.position=c(0.98,0.01),legend.spacing.y = unit(0.01,'cm'))+
+  ggsave('graphs/op_trim_Amplitude_variation.png',type='cairo', width= 4, height= 4, dpi = 800)
+```
+
+
+
+### FFT- Frequency Freatures
+A measure of rhythm regularity was calculated by undertaking Fast Fourier Transform to find the distribution of frequencies within each finger tap time series, and then measuring the power of the dominant frequency peak added to the power of the frequencies 0.2 Hz either side of it. A more regular tapping rhythm concentrates power in a narrow frequency band, increasing the power of the dominant frequency peak (and its immediate neighbours), whereas a more irregular tapping rhythm leads to a more widely spread distribution of frequency bands, reducing the power of the dominant frequency peak (and its immediate neighbours).
+```{r message=FALSE, warning=FALSE,include=FALSE}
+detach("package:plyr", unload = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+df_fft <-  df_ft_trim %>% dplyr::filter(!grepl("P64",ppid)) %>% 
+  select(ppid, Hand, trial_num, Device, pp, dist_norm,time) %>% 
+  group_by(ppid,Hand,trial_num,Device,pp) %>% 
+  mutate(mean_dis = dist_norm - mean(dist_norm),
+         xlen = length(dist_norm),
+         NFFT = 2 ^ nextpow2(xlen),
+         yf = fft(mean_dis,NFFT)/xlen*2,
+         yf = abs(yf),
+         Fs = 60,
+         step = NFFT/2+1,
+         features = TRUE) %>% 
+  mutate(features = if_else(row_number() <= step, features, !features)) %>% 
+  dplyr::filter(features) %>% 
+  mutate(f = Fs / 2 * seq(from=0, to=1, length.out= step)) %>% 
+  select(-features,-step,-Fs) %>% 
+  mutate(idx = which.max(yf),
+         interval = 2,
+         idx_int = idx + interval,
+         int_idx = idx - interval,
+         Freq_feature = ifelse(idx <= interval, sum(yf[1:idx_int]), sum(yf[int_idx:idx_int])),
+         t = (row_number()*delta_t)-delta_t) %>% 
+  select(-idx,-interval,-idx_int,-int_idx,-xlen)
+```
+
+
+#### Healthy Control 
+```{r include=FALSE}
+fft_sig <- df_fft %>% dplyr::filter(ppid == " C06 ") %>% dplyr::filter(trial_num == " 1") %>% filter( Hand == " Left ") %>%  filter (Device == "OPTOTRAK ") %>%
+  mutate(max_yf = f[which.max(yf)])
+```
+
+```{r echo=FALSE}
+a_fft <- ggplot(fft_sig , aes(x=f, y = yf, color=Device))+
+  geom_path(show.legend = FALSE, size = 0.8) +
+  geom_vline(xintercept = fft_sig$max_yf, linetype="dotted", 
+                color = "blue", size=1)+
+  xlab("") +
+  ylab("") +
+  labs(title = 'Frequency Distirbution')+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))
+  
+  ggsave('graphs/C06_Left_T1_op_fft.png',type='cairo', width= 10, height= 6, dpi = 800)
+```
+
+#### PD Patient 
+```{r include=FALSE}
+fft_sig_pd <- df_fft %>% dplyr::filter(ppid == " P70 ") %>% dplyr::filter(trial_num == " 2") %>% filter( Hand == " Right ") %>% filter (Device == "OPTOTRAK ") %>% 
+  mutate(max_yf = f[which.max(yf)])
+```
+
+```{r echo=FALSE}
+b_fft <- ggplot(fft_sig_pd  ,
+       aes(x=f, y = yf, color=Device))+
+  geom_path(size = 0.8) +
+  geom_vline(xintercept = fft_sig_pd$max_yf, linetype="dotted", 
+                color = "blue", size=1)+
+  xlab("Frequency (Hz)") +
+  ylab("") +
+  theme_bw()+
+  theme(axis.title.x = element_text(size=12),
+        legend.box.just = "top",legend.justification = c(1,0.99),
+        legend.position=c(1,0.99),legend.title = element_blank(),
+        legend.background = element_rect(fill = alpha("white",0)))+
+  ggsave('graphs/P70_Right_T2_op_fft.png',type='cairo', width= 10, height= 6, dpi = 800)
+```
+
+```{r}
+ggarrange(a_fft, b_fft, labels = c("a", "b"),
+                    ncol = 1, nrow = 2)+
+ggsave('graphs/P72_C06_op_fft.png',type='cairo', width= 7, height= 4, dpi = 800)
+```
+
+
+
+
+```{r include=FALSE}
+df_fft_op <- df_fft %>% ungroup() %>% filter(Device == 'OPTOTRAK ')
+```
+
+#### one way ANOVA
+```{r echo=FALSE}
+fft_one.way <- aov(Freq_feature ~ pp, data = df_fft_op)
+summary(fft_one.way)
+```
+#### Effect of pp on Rhythm regularity 
+```{r }
+fft.pp_pwc <- df_fft_op %>%
+  pairwise_t_test(
+    Freq_feature ~ pp, paired = FALSE,
+    p.adjust.method = "bonferroni"
+    )
+fft.pp_pwc
+```
+
+```{r }
+
+CV.pp_d <- df_amp_op %>%
+  cohens_d(windows_CV ~ pp,
+           paired=FALSE)
+CV.pp_d 
+```
+
+#### Two way ANOVA
+```{r echo=FALSE}
+fft_two.way <- aov(Freq_feature ~ pp*Hand, data = df_fft_op)
+summary(fft_two.way)
+```
+```{r}
+tukey.fft_two.way <- TukeyHSD(fft_two.way)
+tukey.fft_two.way
+```
+
+#### SD, SE & CI
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+freq_se <- summarySE(df_fft_op, measurevar="Freq_feature", groupvars=c("Hand","pp"))
+freq_se
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+freq_se_pp <- summarySE(df_fft_op, measurevar="Freq_feature", groupvars=c("pp"))
+freq_se_pp
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+freq_se_hand <- summarySE(df_fft_op, measurevar="Freq_feature", groupvars=c("Hand"))
+freq_se_hand
+```
+
+```{r}
+res.ezaov <- ezANOVA(df_fft_op ,
+dv = Freq_feature, # specify dependent variable
+wid = ppid, # specify the subject variable
+within = .(Hand),
+type = 3,detailed = TRUE, return_aov = TRUE)
+#res.ezaov
+get_anova_table(res.ezaov$ANOVA)
+```
+
+##### Tukey-HSD Test
+```{r echo=FALSE}
+freq_pp <- df_fft_op %>%
+  group_by(Hand) %>%
+  tukey_hsd(Freq_feature ~ pp)
+freq_pp
+```
+#### Cohen's d
+```{r echo=FALSE}
+fft.d <- df_fft_op %>% group_by(Hand) %>% 
+  cohens_d(Freq_feature ~ pp,
+           paired=FALSE)
+ fft.d 
+```
+
+```{r message=FALSE, warning=FALSE,echo=FALSE}
+c_fft <- ggplot(freq_se , aes(x=as.factor(pp), y=Freq_feature, colour=Hand, group=Hand,linetype=Hand)) + 
+  geom_errorbar(aes(ymin=(Freq_feature-sd), ymax=(Freq_feature+sd),
+                    colour=Hand), size=1, width=.3, position=pd) +
+  geom_line(position=pd) +
+  geom_point(position=pd, size=3, shape=21, fill="white") + # 21 is filled circle
+  xlab("") +
+  ylab("Rhythm (mm/Hz)") +
+  scale_colour_hue(name="Hand",    # Legend label, use darker colors
+                   breaks=c("Left", "Right"),
+                   labels=c("Left", "Right"),
+                   l=40) +                    # Use darker colors, lightness=40
+  expand_limits(y=0) +                        # Expand y range
+  scale_y_continuous(breaks=0:10*0.2) +     
+  theme_bw() +
+  theme(strip.background = element_rect(color = 'black',fill = 'NA',size = 1.2)) +
+  theme(panel.background = element_rect(color = 'black',fill = 'NA',size = 1.2)) +
+  stat_pvalue_manual(freq_pp, label ="p.adj.signif",
+                     y.position = c(0.85,0.9),
+                     xmin = "group1",xmax  = "group2",tip.length = 0,
+                     step.group.by = "Hand",linetype ="Hand",
+                     color = "Hand",position = pd)+
+  labs(color  = "Hand", linetype = "Hand", group = "Hand") +
+  theme(legend.box.just = "left",legend.justification = c(0.98,0.1), legend.position=c(0.98,0.1))+
+  ggsave('graphs/op_trim_Rhythm.png',type='cairo', width= 6, height= 6, dpi = 800)
+```
+
+```{r}
+ggarrange(a_speed, b_amp,c_fft, labels = c("a", "b", 'c'),
+                    ncol = 1, nrow = 3)+
+ggsave('graphs/op_measures.png',type='cairo', width= 5, height= 10, dpi = 800)
+```
+
+
+### Coeficient of variation between Peaks 
+
+```{r echo=FALSE,include=FALSE}
+detach("package:plyr", unload = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+df_peaks <- df_ft_trim %>% dplyr::filter(!grepl("P64",ppid)) %>%
+  select(ppid, Hand, trial_num, Device, pp, dist_norm,time) %>% 
+  group_by(ppid,Hand,trial_num,Device) %>% 
+  mutate(mean_dis = dist_norm - mean(dist_norm),
+         is_peak = set_peaks_column(mean_dis)) %>% 
+  dplyr::filter(is_peak) %>% 
+  mutate(time_period = c(NA, diff(time))) %>% 
+  dplyr::filter(!is.na(time_period)) %>% 
+  mutate(Cov = sd(time_period)/mean(time_period),
+         t = (row_number()*delta_t)-delta_t)
+```
+
+
+
+```{r include=FALSE}
+df_covPeaks_op <- df_peaks %>% ungroup() %>% filter(Device == 'OPTOTRAK ')
+```
+
+#### Two-way ANOVA
+```{r echo=FALSE}
+cov_two.way <- aov(Cov ~ pp*Hand, data = df_covPeaks_op)
+summary(cov_two.way)
+```
+
+#### SD, SE & CI
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+CVpeaks_se_pp <- summarySE(df_covPeaks_op, measurevar="Cov", groupvars=c("Hand","pp"))
+CVpeaks_se_pp
+```
+
+#### Tukey-HSD Test
+```{r echo=FALSE}
+CVpeaks_pp <- df_covPeaks_op %>%
+  group_by(Hand) %>%
+  tukey_hsd(Cov ~ pp)
+CVpeaks_pp
+```
+
+```{r message=FALSE, warning=FALSE,echo=FALSE}
+ggplot(CVpeaks_se_pp , aes(x=as.factor(pp), y=Cov, colour=Hand, group=Hand,linetype=Hand)) + 
+  geom_errorbar(aes(ymin=(Cov-sd), ymax=(Cov+sd),
+                    colour=Hand), size=1, width=.3, position=pd) +
+  geom_line(position=pd) +
+  geom_point(position=pd, size=3, shape=21, fill="white") + # 21 is filled circle
+  xlab("") +
+  ylab("CoV between Peaks") +
+  scale_colour_hue(name="Hand",    # Legend label, use darker colors
+                   breaks=c("Left", "Right"),
+                   labels=c("Left", "Right"),
+                   l=40) +                    # Use darker colors, lightness=40
+  expand_limits(y=0) +                        # Expand y range
+  scale_y_continuous(breaks=0:10*0.1) +     
+  theme_bw() +
+  theme(strip.background = element_rect(color = 'black',fill = 'NA',size = 1.2)) +
+  theme(panel.background = element_rect(color = 'black',fill = 'NA',size = 1.2)) +
+  stat_pvalue_manual(CVpeaks_pp, label ="p.adj.signif",
+                     y.position = c(0.35,0.4),
+                     xmin = "group1",xmax  = "group2",tip.length = 0,
+                     step.group.by = "Hand",linetype ="Hand",
+                     color = "Hand",position = pd)+
+  labs(color  = "Hand", linetype = "Hand", group = "Hand") +
+  theme(legend.box.just = "left",legend.justification = c(0.98,0.01), legend.position=c(0.98,0.01),
+        legend.spacing.y = unit(0.1, 'cm'), legend.key.height = unit(0.5,'cm'))+
+  ggsave('graphs/op_trim_CV_peaks.png',type='cairo', width= 4, height= 4, dpi = 800)
+```
+
+
+
+### Correlation & Regression (Original data)
+Correlation between objective measures
+#### Amplitude Variation
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+orig_big_amp_cor <- df_amplitude %>%  select(-dist_norm) %>% 
+  dplyr::filter(Device == 'BIGKAT ') 
+
+orig_op_amp_cor <- df_amplitude %>% ungroup() %>% select(-dist_norm) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+orig_df_amp_cor <- left_join(orig_op_amp_cor,orig_big_amp_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+orig_df_amp_cor<-orig_df_amp_cor[complete.cases(orig_df_amp_cor),]
+
+
+orig_df_amp_cor_trials <- orig_df_amp_cor %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(windows_CV.x = mean(windows_CV.x),
+            windows_CV.y = mean(windows_CV.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+# cor.test 
+
+library(plyr)
+
+# cor summary
+orig_amplitude_cor_pp_allTrials_sum <- ddply(orig_df_amp_cor, .(pp),
+                               summarise,z=corfun(windows_CV.x, windows_CV.y)$statistic,
+                               pval=corfun(windows_CV.x, windows_CV.y)$p.value,
+                               cor.est=corfun(windows_CV.x, windows_CV.y)$estimate,
+                               alt=corfun(windows_CV.x, windows_CV.y)$alternative
+)
+
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a_amp_cor <- ggplot(orig_df_amp_cor_trials,aes(y = windows_CV.x, x = windows_CV.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 1,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 0.8) +
+  #coord_equal() +
+  expand_limits(x = 0, y = 0) +
+  scale_y_continuous(breaks=0:10*0.2) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width' )+
+  theme_bw()+
+  facet_grid(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())+
+  ggsave("graphs/orig_comparison_amp.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
+
+#### Average Speed
+
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+orig_big_sp_cor <- df_speed_ave %>%  select(-dist_norm,-mean_dis,-is_peak,-speed_peak,-ave_speed_peak) %>%
+  dplyr::filter(Device == 'BIGKAT ') 
+
+orig_op_sp_cor <- df_speed_ave %>% ungroup() %>% select(-dist_norm,-mean_dis,-is_peak,-speed_peak,-ave_speed_peak) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+orig_df_sp_cor <- left_join(orig_op_sp_cor,orig_big_sp_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+orig_df_sp_cor<-orig_df_sp_cor[complete.cases(orig_df_sp_cor),]
+
+orig_df_sp_cor_trials <- orig_df_sp_cor %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(ave_speed.x = mean(ave_speed.x),
+            ave_speed.y = mean(ave_speed.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+# cor.test 
+
+library(plyr)
+
+# cor summary
+orig_speed_cor_pp_allTrials_sum <- ddply(orig_df_sp_cor, .(Hand,pp),
+                               summarise,z=corfun(ave_speed.x, ave_speed.y)$statistic,
+                               pval=corfun(ave_speed.x, ave_speed.y)$p.value,
+                               cor.est=corfun(ave_speed.x, ave_speed.y)$estimate,
+                               alt=corfun(ave_speed.x, ave_speed.y)$alternative
+)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a_speed_cor <- ggplot(orig_df_sp_cor_trials,aes(y = ave_speed.x, x = ave_speed.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 7,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 6) +
+  #coord_equal() +
+  expand_limits(x = 0, y = 0) +
+  scale_y_continuous(breaks=0:8*2) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width' )+
+  theme_bw()+
+  facet_grid(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())
+a_speed_cor + ggsave("graphs/orig_comparison_speed.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
+
+#### FFT Correlation
+
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+orig_big_fft_cor <- df_fft %>%  select(-dist_norm,-mean_dis,-time,-NFFT,-f) %>% 
+  dplyr::filter(Device == 'BIGKAT ') 
+
+orig_op_fft_cor <- df_fft %>% ungroup() %>% select(-dist_norm,-mean_dis,-time,-NFFT,-f) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+orig_df_fft_cor <- left_join(orig_op_fft_cor,orig_big_fft_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+orig_df_fft_cor<-orig_df_fft_cor[complete.cases(orig_df_fft_cor),]
+
+orig_df_fft_cor_trials <- orig_df_fft_cor %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(yf.x = mean(yf.x),
+            yf.y = mean(yf.y),
+            Freq_feature.x = mean(Freq_feature.x),
+            Freq_feature.y = mean(Freq_feature.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+# cor.test 
+
+library(plyr)
+
+orig_fft_cor_pp_sum <- ddply(orig_df_fft_cor_trials, .(pp),
+                               summarise,z=corfun(Freq_feature.x, Freq_feature.y)$statistic,
+                               pval=corfun(Freq_feature.x, Freq_feature.y)$p.value,
+                               cor.est=corfun(Freq_feature.x, Freq_feature.y)$estimate,
+                               alt=corfun(Freq_feature.x, Freq_feature.y)$alternative
+)
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a_fft_cor <- ggplot(orig_df_fft_cor_trials,aes(y = Freq_feature.x, x = Freq_feature.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 1.2,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 1) +
+  #coord_equal() +
+  expand_limits(x = 0, y = 0) +
+   scale_y_continuous(breaks=0:10*0.2) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width' )+
+  theme_bw()+
+  facet_grid(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())
+a_fft_cor +  ggsave("graphs/orig_comparison_fft.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
+
+#### Time Period Correlation
+
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+orig_big_cov_cor <- df_peaks %>%  select(-dist_norm,-mean_dis,-time,-is_peak) %>% 
+  dplyr::filter(Device == 'BIGKAT ') 
+
+orig_op_cov_cor <- df_peaks  %>% select(-dist_norm,-mean_dis,-time,-is_peak) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+orig_df_cov_cor <- left_join(orig_op_cov_cor,orig_big_cov_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+orig_df_cov_cor<-orig_df_cov_cor[complete.cases(orig_df_cov_cor),]
+
+orig_df_cov_cor_trials <- orig_df_cov_cor %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(time_period.x = mean(time_period.x),
+            time_period.y = mean(time_period.y),
+            Cov.x = mean(Cov.x),
+            Cov.y = mean(Cov.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+# cor.test 
+
+library(plyr)
+
+orig_cov_cor_pp_sum <- ddply(orig_df_cov_cor_trials, .(pp),
+                               summarise,z=corfun(Cov.x, Cov.y)$statistic,
+                               pval=corfun(Cov.x, Cov.y)$p.value,
+                               cor.est=corfun(Cov.x, Cov.y)$estimate,
+                               alt=corfun(Cov.x, Cov.y)$alternative
+)
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a_peak_cor <- ggplot(orig_df_cov_cor_trials,aes(y = time_period.x, x = time_period.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 0.8,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 0.65) +
+  #coord_equal() +
+  expand_limits(x = 0, y = 0) +
+  scale_y_continuous(breaks=0:10*0.2) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width')+
+  theme_bw()+
+  facet_grid(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())
+a_peak_cor + ggsave("graphs/orig_comparison_time_period_Peaks.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
+
+
+
+#### Absolute Distance
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+big_dis_cor <- df_ft_trim %>%  select(-dist_norm,-is_reaching,-speed,-time) %>% 
+  dplyr::filter(Device == 'BIGKAT ')
+
+op_dis_cor <- df_ft_trim %>% ungroup() %>% select(-dist_norm,-is_reaching,-speed,-time) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+df_dis_cor <- left_join(op_dis_cor,big_dis_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+df_dis_cor<-df_dis_cor[complete.cases(df_dis_cor),]
+# cor.test 
+
+df_dis_filt <- df_dis_cor %>% filter(ppid == " P72 ", Hand == " Left ", trial_num == " 1")
+
+df_dis_full <- anti_join(df_dis_cor,df_dis_filt)
+
+
+df_dis_cor_trials <- df_dis_full %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(abs_dis.x = mean(abs_dis.x),
+            abs_dis.y = mean(abs_dis.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+
+library(plyr)
+
+# cor summary
+dis_cor_allTrials_sum <- ddply(df_dis_full, .(trial_num,ppid,Hand,pp),
+                               summarise,z=corfun(abs_dis.x, abs_dis.y)$statistic,
+                               pval=corfun(abs_dis.x, abs_dis.y)$p.value,
+                               cor.est=corfun(abs_dis.x, abs_dis.y)$estimate,
+                               alt=corfun(abs_dis.x, abs_dis.y)$alternative
+) 
+dis_cor_allTrials_sum <- dis_cor_allTrials_sum %>% arrange(ppid,Hand,trial_num) 
+
+dis_cor_allTrials_sum %>% write.csv("abs_dis_cor_result_allTrials.csv")
+dis_cor_allTrials_sum
+```
+
+
+
+```{r echo=FALSE}
+ggplot(df_dis_cor_trials,aes(y = abs_dis.x, x = abs_dis.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 140,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 110) +
+  #coord_equal() +
+  expand_limits(x = 0, y = 0) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width',tag = 'e' )+
+  theme_bw()+
+  facet_wrap(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())+
+  ggsave("graphs/comparison_abs_dis.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
+
+
+
+
+
+
+### Correlation & Regression (Filtered Data)
+Correlation between objective measures
+#### Amplitude Variation
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+big_amp_cor <- df_amplitude %>%  select(-dist_norm) %>% 
+  dplyr::filter(Device == 'BIGKAT ') 
+
+op_amp_cor <- df_amplitude %>% ungroup() %>% select(-dist_norm) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+df_amp_cor <- left_join(op_amp_cor,big_amp_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+df_amp_cor<-df_amp_cor[complete.cases(df_amp_cor),]
+
+df_amp_p72 <- df_amp_cor %>% filter(ppid == " P72 ", Hand == " Left ", trial_num == " 1")
+df_amp_p83 <- df_amp_cor %>% filter(ppid == " P83 ", Hand == " Right ", trial_num == " 1")
+df_amp_p75 <- df_amp_cor %>% filter(ppid == " P75 ", Hand == " Right ", trial_num == " 3")
+
+
+df_amp_filt <- rbind(df_amp_p72,df_amp_p83,df_amp_p75)
+df_amp_full <- anti_join(df_amp_cor,df_amp_filt)
+
+df_amp_cor_trials <- df_amp_full %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(windows_CV.x = mean(windows_CV.x),
+            windows_CV.y = mean(windows_CV.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+# cor.test 
+
+library(plyr)
+
+# cor summary
+amplitude_cor_pp_allTrials_sum <- ddply(df_amp_cor, .(ppid,Hand,pp),
+                               summarise,z=corfun(windows_CV.x, windows_CV.y)$statistic,
+                               pval=corfun(windows_CV.x, windows_CV.y)$p.value,
+                               cor.est=corfun(windows_CV.x, windows_CV.y)$estimate,
+                               alt=corfun(windows_CV.x, windows_CV.y)$alternative
+)
+
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+b_amp_cor <- ggplot(df_amp_cor_trials,aes(y = windows_CV.x, x = windows_CV.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 1,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 0.8) +
+  #coord_equal() +
+  #expand_limits(x = 0, y = 0) +
+  scale_y_continuous(breaks=0:10*0.2) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width')+
+  theme_bw()+
+  facet_grid(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())+
+  ggsave("graphs/comparison_amp.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
+
+```{r}
+ggarrange(a_amp_cor, b_amp_cor, labels = c("a", "b"),
+                    ncol = 1, nrow = 2)+
+ggsave('graphs/amp_regression.png',type='cairo', width= 7, height= 8, dpi = 800)
+```
+
+
+#### Average Speed
+
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+big_sp_cor <- df_speed_ave %>%  select(-dist_norm,-mean_dis,-is_peak,-speed_peak,-ave_speed_peak) %>% 
+  dplyr::filter(Device == 'BIGKAT ') 
+
+op_sp_cor <- df_speed_ave %>% ungroup() %>% select(-dist_norm,-mean_dis,-is_peak,-speed_peak,-ave_speed_peak) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+df_sp_cor <- left_join(op_sp_cor,big_sp_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+df_sp_cor<-df_sp_cor[complete.cases(df_sp_cor),]
+
+df_sp_p71 <- df_sp_cor %>% filter(ppid == " P71 ", Hand == " Right ", trial_num == " 3")
+df_sp_p72 <- df_sp_cor %>% filter(ppid == " P72 ", Hand == " Left ", trial_num == " 1")
+df_sp_c05 <- df_sp_cor %>% filter(ppid == " C05 ", Hand == " Right ", trial_num == " 4")
+
+
+df_sp_filt <- rbind(df_sp_p71,df_sp_p72,df_sp_c05)
+df_sp_full <- anti_join(df_sp_cor,df_sp_filt)
+
+df_sp_cor_trials <- df_sp_full %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(ave_speed.x = mean(ave_speed.x),
+            ave_speed.y = mean(ave_speed.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+# cor.test 
+
+library(plyr)
+
+# cor summary
+speed_cor_pp_allTrials_sum <- ddply(df_sp_cor, .(Hand,pp),
+                               summarise,z=corfun(ave_speed.x, ave_speed.y)$statistic,
+                               pval=corfun(ave_speed.x, ave_speed.y)$p.value,
+                               cor.est=corfun(ave_speed.x, ave_speed.y)$estimate,
+                               alt=corfun(ave_speed.x, ave_speed.y)$alternative
+)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+b_speed_cor <- ggplot(df_sp_cor_trials,aes(y = ave_speed.x, x = ave_speed.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 7,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 6) +
+  #coord_equal() +
+  expand_limits(x = 0, y = 0) +
+  scale_y_continuous(breaks=0:8*2) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width',tag = 'b' )+
+  theme_bw()+
+  facet_grid(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())
+b_speed_cor + ggsave("graphs/comparison_speed.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
+
+```{r}
+ggarrange(a_speed_cor, b_speed_cor, labels = c("a", "b"),
+                    ncol = 1, nrow = 2)+
+ggsave('graphs/speed_regression.png',type='cairo', width= 7, height= 8, dpi = 800)
+```
+
+
+#### FFT Correlation
+
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+big_fft_cor <- df_fft %>%  select(-dist_norm,-mean_dis,-time,-NFFT,-f) %>% 
+  dplyr::filter(Device == 'BIGKAT ') 
+
+op_fft_cor <- df_fft %>% ungroup() %>% select(-dist_norm,-mean_dis,-time,-NFFT,-f) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+df_fft_cor <- left_join(op_fft_cor,big_fft_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+df_fft_cor<-df_fft_cor[complete.cases(df_fft_cor),]
+
+df_fft_c06 <- df_fft_cor %>% filter(ppid == " C06 ", Hand == " Left ", trial_num == " 4")
+df_fft_p72 <- df_fft_cor %>% filter(ppid == " P72 ", Hand == " Left ", trial_num == " 1")
+
+df_fft_c05 <- df_fft_cor %>% filter(ppid == " C05 ", Hand == " Right ", trial_num == " 4")
+
+df_fft_p78 <- df_fft_cor %>% filter(ppid == " P78 ", Hand == " Right ", trial_num == " 4")
+
+
+
+df_fft_filt <- rbind(df_fft_c06,df_fft_p72,df_fft_c05,df_fft_p78)
+df_fft_full <- anti_join(df_fft_cor,df_fft_filt)
+
+
+
+df_fft_cor_trials <- df_fft_full %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(yf.x = mean(yf.x),
+            yf.y = mean(yf.y),
+            Freq_feature.x = mean(Freq_feature.x),
+            Freq_feature.y = mean(Freq_feature.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+# cor.test 
+
+library(plyr)
+
+fft_cor_pp_sum <- ddply(df_fft_cor_trials, .(ppid,Hand,pp),
+                               summarise,z=corfun(Freq_feature.x, Freq_feature.y)$statistic,
+                               pval=corfun(Freq_feature.x, Freq_feature.y)$p.value,
+                               cor.est=corfun(Freq_feature.x, Freq_feature.y)$estimate,
+                               alt=corfun(Freq_feature.x, Freq_feature.y)$alternative
+)
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+b_fft_cor <- ggplot(df_fft_cor_trials,aes(y = Freq_feature.x, x = Freq_feature.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 1.2,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 1) +
+  #coord_equal() +
+  expand_limits(x = 0, y = 0) +
+  scale_y_continuous(breaks=0:10*0.2) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width' )+
+  theme_bw()+
+  facet_grid(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())
+b_fft_cor + ggsave("graphs/comparison_fft.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
+
+```{r}
+ggarrange(a_fft_cor, b_fft_cor, labels = c("a", "b"),
+                    ncol = 1, nrow = 2)+
+ggsave('graphs/fft_regression.png',type='cairo', width= 7, height= 8, dpi = 800)
+```
+
+#### Time Period Correlation
+
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+big_cov_cor <- df_peaks %>%  select(-dist_norm,-mean_dis,-time,-is_peak) %>% 
+  dplyr::filter(Device == 'BIGKAT ') 
+
+op_cov_cor <- df_peaks  %>% select(-dist_norm,-mean_dis,-time,-is_peak) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+df_cov_cor <- left_join(op_cov_cor,big_cov_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+df_cov_cor<-df_cov_cor[complete.cases(df_cov_cor),]
+
+# df_fft_c06 <- df_cov_cor %>% filter(ppid == " C06 ", Hand == " Left ", trial_num == " 4")
+# df_fft_p72 <- df_cov_cor %>% filter(ppid == " P72 ", Hand == " Left ", trial_num == " 1")
+# 
+# df_fft_c05 <- df_cov_cor %>% filter(ppid == " C05 ", Hand == " Right ", trial_num == " 4")
+# 
+# df_fft_p78 <- df_cov_cor %>% filter(ppid == " P78 ", Hand == " Right ", trial_num == " 4")
+# 
+# 
+# 
+# df_fft_filt <- rbind(df_cov_c06,df_fft_p72,df_fft_c05,df_fft_p78)
+# df_fft_full <- anti_join(df_fft_cor,df_fft_filt)
+
+
+
+df_cov_cor_trials <- df_cov_cor %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(time_period.x = mean(time_period.x),
+            time_period.y = mean(time_period.y),
+            Cov.x = mean(Cov.x),
+            Cov.y = mean(Cov.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+# cor.test 
+
+library(plyr)
+
+cov_cor_pp_sum <- ddply(df_cov_cor_trials, .(ppid,Hand,pp),
+                               summarise,z=corfun(Cov.x, Cov.y)$statistic,
+                               pval=corfun(Cov.x, Cov.y)$p.value,
+                               cor.est=corfun(Cov.x, Cov.y)$estimate,
+                               alt=corfun(Cov.x, Cov.y)$alternative
+)
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+b_peak_cor <- ggplot(df_cov_cor_trials,aes(y = time_period.x, x = time_period.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 0.8,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 0.65) +
+  #coord_equal() +
+  expand_limits(x = 0, y = 0) +
+    scale_y_continuous(breaks=0:10*0.2) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width' )+
+  theme_bw()+
+  facet_wrap(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())
+b_peak_cor + ggsave("graphs/comparison_time_period_Peaks.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
+```{r}
+ggarrange(a_peak_cor, b_peak_cor, labels = c("a", "b"),
+                    ncol = 1, nrow = 2)+
+ggsave('graphs/peak_regression.png',type='cairo', width= 7, height= 8, dpi = 800)
+```
+
+
+#### Absolute Distance
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE,echo=FALSE}
+detach("package:plyr", unload = TRUE)
+big_dis_cor <- df_ft_trim %>%  select(-dist_norm,-is_reaching,-speed,-time) %>% 
+  dplyr::filter(Device == 'BIGKAT ')
+
+op_dis_cor <- df_ft_trim %>% ungroup() %>% select(-dist_norm,-is_reaching,-speed,-time) %>% 
+  dplyr::filter(Device == 'OPTOTRAK ')
+
+df_dis_cor <- left_join(op_dis_cor,big_dis_cor,
+                              by= c('t','trial_num','ppid','Hand','pp'), all= TRUE,)
+
+df_dis_cor<-df_dis_cor[complete.cases(df_dis_cor),]
+# cor.test 
+
+df_dis_filt <- df_dis_cor %>% filter(ppid == " P72 ", Hand == " Left ", trial_num == " 1")
+
+df_dis_full <- anti_join(df_dis_cor,df_dis_filt)
+
+
+df_dis_cor_trials <- df_dis_full %>% select(-Device.x,-Device.y,-t) %>% 
+  group_by(trial_num,ppid, Hand, pp) %>% 
+  summarise(abs_dis.x = mean(abs_dis.x),
+            abs_dis.y = mean(abs_dis.y)) %>% 
+  arrange(ppid,Hand,trial_num)
+
+library(plyr)
+
+# cor summary
+dis_cor_allTrials_sum <- ddply(df_dis_full, .(trial_num,ppid,Hand,pp),
+                               summarise,z=corfun(abs_dis.x, abs_dis.y)$statistic,
+                               pval=corfun(abs_dis.x, abs_dis.y)$p.value,
+                               cor.est=corfun(abs_dis.x, abs_dis.y)$estimate,
+                               alt=corfun(abs_dis.x, abs_dis.y)$alternative
+) 
+dis_cor_allTrials_sum <- dis_cor_allTrials_sum %>% arrange(ppid,Hand,trial_num) 
+
+dis_cor_allTrials_sum %>% write.csv("abs_dis_cor_result_allTrials.csv")
+dis_cor_allTrials_sum
+```
+
+
+
+```{r echo=FALSE}
+ggplot(df_dis_cor_trials,aes(y = abs_dis.x, x = abs_dis.y,  color = as.factor(pp)))+
+  geom_point(size=2,color = 'black',show.legend = FALSE) +
+  stat_smooth(method = "lm",fullrange = T,show.legend = FALSE)+
+  stat_smooth_func_with_pval(geom="text",
+                             method="lm",
+                             color = 'black',
+                             hjust=0,
+                             parse=TRUE,
+                             xpos = 0,
+                             ypos = 140,
+                             size=3.5,
+                             xpos2 = 0,
+                             ypos2 = 110) +
+  #coord_equal() +
+  expand_limits(x = 0, y = 0) +
+  labs(x = "BIGKAT", y = "Optotrak",color='width',tag = 'e' )+
+  theme_bw()+
+  facet_wrap(Hand~pp)+
+  #coord_cartesian(xlim = c(0, 120),ylim = c(0,180))+
+  theme(strip.background =element_rect(fill="white"))+
+  theme(strip.text = element_text(colour = 'black'))+
+  theme(axis.ticks = element_blank())+
+  scale_color_manual(values = c("tomato", "green"))+
+  theme(legend.text=element_blank())+
+  #theme(legend.title=element_text()) +
+  theme(legend.title = element_blank())+
+  ggsave("graphs/comparison_abs_dis.png", type = "cairo", width = 6, height = 5,dpi = 800)
+```
